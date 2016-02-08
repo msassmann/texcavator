@@ -12,14 +12,14 @@ from django.http import HttpResponse
 from django.shortcuts import get_object_or_404
 from django.core.validators import validate_email
 from django.views.decorators.csrf import csrf_exempt
-from django.contrib.auth.decorators import login_required
+from django.contrib.auth.decorators import login_required, permission_required
 from django.core.servers.basehttp import FileWrapper
 from django.conf import settings
 from django.db.models import Q, Min, Max
 from django.db import IntegrityError
 
 from .models import Distribution, ArticleType, Query, DayStatistic, \
-    StopWord, Pillar, Newspaper, Period
+    StopWord, Pillar, Newspaper, Period, Term
 from .utils import get_query_object, query2docidsdate, count_results
 from .burstsdetector import bursts
 from .download import create_zipname, execute
@@ -277,15 +277,15 @@ def delete_stopword(request, stopword_id):
     """Deletes a stopword from the stopword list.
     """
     stopword = StopWord.objects.get(pk=stopword_id)
+
     if not stopword:
         return json_response_message('ERROR', 'Stopword not found.')
-
     if not request.user == stopword.user:
-        return json_response_message('ERROR', 'Stopword does not belong to '
-                                              'user.')
-    stopword.delete()
+        return json_response_message('ERROR', 'Stopword does not belong to this user.')
 
-    return json_response_message('SUCCESS', 'Stopword deleted.')
+    msg = 'Stopword {} deleted.'.format(stopword.word)
+    stopword.delete()
+    return json_response_message('SUCCESS', msg)
 
 
 # TODO: turn into get method (get user via currently logged in user)
@@ -342,12 +342,22 @@ def download_prepare(request):
                 format(request.user.username))
 
     user = request.user
+    
+    if not user.has_perm('query.download_documents'):
+        msg = 'You are not allowed to download query results. '
+        msg += 'Please contact the administrators for further information.'
+        return json_response_message('error', msg)
+    
     query = Query.objects.get(title=request.GET.get('query_title'), user=user)
     count = count_results(query)
+    if user.has_perm('query.download_many_documents'):
+        maximum = settings.QUERY_DATA_MAX_RESULTS
+    else:
+        maximum = settings.QUERY_DATA_UNPRIV_RESULTS
 
-    if count > settings.QUERY_DATA_MAX_RESULTS:
-        msg = "Your query has too much results to export: " + str(count)
-        msg += " where " + str(settings.QUERY_DATA_MAX_RESULTS) + " are allowed. "
+    if count > maximum:
+        msg = "Your query has too many results to export: " + str(count)
+        msg += " where " + str(maximum) + " are allowed. "
         msg += "Please consider filtering your results before exporting."
         return json_response_message('error', msg)
 
@@ -389,6 +399,7 @@ def download_prepare(request):
 
 
 @csrf_exempt
+@permission_required('query.download_documents', raise_exception=True)
 @login_required
 def download_data(request, zip_name):
     """Downloads the prepared data created from :func:`views.download_prepare` above
@@ -426,6 +437,11 @@ def retrieve_pillars(request):
     pillars = Pillar.objects.all()
     return json_response_message('ok', '', {'result': [{'id': p.id, 'name': p.name} for p in pillars]})
 
+
+def retrieve_timeframes(request):
+    """Retrieves all timeframes of Terms as JSON objects
+    """
+    return json_response_message('ok', '', {'result': [{'id': t[0], 'name': t[1]} for t in Term.TIMEFRAME_CHOICES]})
 
 @login_required
 def export_newspapers(request):

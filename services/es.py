@@ -3,7 +3,8 @@
 
 import json
 import logging
-from collections import Counter
+import os
+from collections import Counter, defaultdict
 from datetime import datetime
 
 from elasticsearch import Elasticsearch
@@ -179,7 +180,7 @@ def create_query(query_str, date_ranges, exclude_distributions,
     newspaper_ids = []
     if selected_pillars:
         try:
-            with open('newspapers.json', 'r') as in_file:
+            with open(os.path.join(settings.PROJECT_PARENT, 'newspapers.txt'), 'rb') as in_file:
                 categorization = json.load(in_file)
                 for pillar, n_ids in categorization.iteritems():
                     if int(pillar) in selected_pillars:
@@ -197,18 +198,9 @@ def create_query(query_str, date_ranges, exclude_distributions,
         filter_must_not.append(
             {"term": {"article_dc_subject": _KB_ARTICLE_TYPE_VALUES[typ]}})
 
-    # Temporary hotfix for duplicate newspapers, see #73.
-    if getattr(settings, 'KB_HOTFIX_DUPLICATE_NEWSPAPERS', True):
-        query_str += ' -identifier:ddd\:11*'
-
     query = {
         'query': {
             'filtered': {
-                'query': {
-                    'query_string': {
-                        'query': query_str
-                    }
-                },
                 'filter': {
                     'bool': {
                         'must': filter_must,
@@ -219,6 +211,14 @@ def create_query(query_str, date_ranges, exclude_distributions,
             }
         }
     }
+
+    # Add the query string part.
+    if query_str:
+        # Temporary hotfix for duplicate newspapers, see #73.
+        if getattr(settings, 'KB_HOTFIX_DUPLICATE_NEWSPAPERS', True):
+            query_str += ' -identifier:ddd\:11*'
+        alw = getattr(settings, 'QUERY_ALLOW_LEADING_WILDCARD', True)
+        query['query']['filtered']['query'] = {'query_string': {'query': query_str, 'allow_leading_wildcard': alw}}
 
     return query
 
@@ -312,7 +312,7 @@ def word_cloud_aggregation(agg_name, num_words=100):
     return agg
 
 
-def single_document_word_cloud(idx, typ, doc_id, min_length=0, stopwords=None, stems=False):
+def single_document_word_cloud(idx, typ, doc_id, min_length=0, stopwords=[], stems=False):
     """Return data required to draw a word cloud for a single document.
 
     Parameters:
@@ -332,22 +332,17 @@ def single_document_word_cloud(idx, typ, doc_id, min_length=0, stopwords=None, s
     Returns:
         dict : dict
             A dictionary that contains word frequencies for all the terms in
-            the document. The data returned is formatted according to what is
-            expected by the user interface:
+            the document.
 
             .. code-block:: javascript
 
                 {
-                    'status': 'ok'
-                    'max_count': ...
+                    'status': 'ok',
                     'result':
-                        [
-                            {
-                                'term': ...
-                                'count': ...
-                            },
-                            ...
-                        ]
+                        {
+                            term: count
+                        },
+                        ...
                 }
     """
 
@@ -362,9 +357,6 @@ def single_document_word_cloud(idx, typ, doc_id, min_length=0, stopwords=None, s
     }
     t_vector = _es().termvector(index=idx, doc_type=typ, id=doc_id, body=bdy)
 
-    if not stopwords:
-        stopwords = []
-
     if t_vector.get('found', False):
         wordcloud = Counter()
         for field, data in t_vector.get('term_vectors').iteritems():
@@ -372,12 +364,8 @@ def single_document_word_cloud(idx, typ, doc_id, min_length=0, stopwords=None, s
                 if term not in stopwords and len(term) >= min_length:
                     wordcloud[term] += int(count_dict.get('term_freq'))
 
-        common_terms = wordcloud.most_common(100)
-        result = [{'term': t, 'count': c} for t, c in common_terms]
-
         return {
-            'max_count': common_terms[0][0],
-            'result': result,
+            'result': wordcloud,
             'status': 'ok'
         }
 
@@ -442,15 +430,29 @@ def multiple_document_word_cloud(idx, typ, query, date_ranges, dist, art_types, 
     }
 
 
-def termvector_wordcloud(idx, typ, doc_ids, min_length=0, stems=False):
+def termvector_wordcloud(idx, typ, doc_ids, min_length=0, stems=False, add_freqs=True):
     """Return word frequencies in a set of documents.
 
     Return data required to draw a word cloud for multiple documents by
     'manually' merging termvectors.
 
     The counter returned by this method can be transformed into the input
-    expected by the interface by passing it to the counter2wordclouddata
+    expected by the interface by passing it to the normalize_cloud
     method.
+
+    Parameters:
+        idx : str
+            The name of the elasticsearch index
+        typ : str
+            The type of document requested
+        doc_ids : list(str)
+            The requested documents
+        min_length : int, optional
+            The minimum length of words in the word cloud
+        stems : boolean, optional
+            Whether or not we should look at the stemmed columns
+        add_freqs : boolean, optional
+            Whether or not we should count total occurrences
 
     See also
         :func:`single_document_word_cloud` generate data for a single document
@@ -460,6 +462,10 @@ def termvector_wordcloud(idx, typ, doc_ids, min_length=0, stems=False):
         terms aggregation approach
     """
     wordcloud = Counter()
+
+    # If no documents are provided, return an empty counter.
+    if not doc_ids:
+        return wordcloud
 
     bdy = {
         'ids': doc_ids,
@@ -476,37 +482,17 @@ def termvector_wordcloud(idx, typ, doc_ids, min_length=0, stems=False):
     t_vectors = _es().mtermvectors(index=idx, doc_type=typ, body=bdy)
 
     for doc in t_vectors.get('docs'):
+        temp = defaultdict(int) if add_freqs else set()
         for field, data in doc.get('term_vectors').iteritems():
-            temp = {}
             for term, details in data.get('terms').iteritems():
                 if len(term) >= min_length:
-                    temp[term] = int(details['term_freq'])
-            wordcloud.update(temp)
+                    if add_freqs:
+                        temp[term] += int(details['term_freq'])
+                    else:
+                        temp.add(term)  # only count individual occurrences
+        wordcloud.update(temp)
 
     return wordcloud
-
-
-def counter2wordclouddata(wordcloud_counter, burst, stopwords=None):
-    """Transform a counter into the data required to draw a word cloud.
-    """
-    if not stopwords:
-        stopwords = []
-    for stopw in stopwords:
-        del wordcloud_counter[stopw]
-
-    result = []
-    for term, count in wordcloud_counter.most_common(100):
-        result.append({
-            'term': term,
-            'count': count
-        })
-
-    return {
-        'max_count': wordcloud_counter.most_common(1)[0][1],
-        'result': result,
-        'status': 'ok',
-        'burstcloud': burst
-    }
 
 
 def get_search_parameters(req_dict):

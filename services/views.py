@@ -1,11 +1,11 @@
 # -* coding: utf-8 -*-
 """Views for the services app
 """
-from sys import stderr, exc_info
-from collections import Counter
-import requests
 import logging
+from collections import Counter
+from sys import stderr, exc_info
 
+import requests
 from celery.result import AsyncResult
 
 from django.conf import settings
@@ -19,7 +19,7 @@ from es import get_search_parameters, do_search, count_search_results, \
     single_document_word_cloud, get_document, \
     metadata_aggregation, get_stemmed_form
 
-from texcavator.utils import json_response_message, daterange2dates
+from texcavator.utils import json_response_message, daterange2dates, normalize_cloud
 
 from query.models import Query, StopWord, Newspaper
 from query.utils import get_query_object
@@ -74,16 +74,20 @@ def doc_count(request):
         print >> stderr, "doc_count()"
 
     query_id = request.REQUEST.get('queryID')
+    logger.info('services/doc_count/ - queryID: {}'.format(query_id))
 
     if query_id:
         query, response = get_query_object(query_id)
 
         if not query:
+            logger.info('services/doc_count/ - returned cached response.')
             return response
     else:
+        logger.info('services/doc_count/ - returned "missing query id".')
         return json_response_message('error', 'Missing query id.')
 
     params = query.get_query_dict()
+    logger.info('services/doc_count/ - params: {}'.format(params))
 
     result = count_search_results(settings.ES_INDEX,
                                   settings.ES_DOCTYPE,
@@ -92,13 +96,16 @@ def doc_count(request):
                                   params['exclude_distributions'],
                                   params['exclude_article_types'],
                                   params['selected_pillars'])
+    logger.info('services/doc_count/ - ES returned normally')
 
     count = result.get('count', 'error')
 
     if not count == 'error':
         params = {'doc_count': str(count)}
+        logger.info('services/doc_count/ - returned calculated count.')
         return json_response_message('ok', 'Retrieved document count.', params)
 
+    logger.info('services/doc_count/ - returned "unable to retrieve".')
     return json_response_message('error', 'Unable to retrieve document count'
                                  ' for query "{query}"' % query)
 
@@ -151,6 +158,10 @@ def tv_cloud(request):
         stopwords = stopwords_user + stopwords_query + stopwords_default
 
     record_id = request.GET.get('record_id')
+    logger.info('services/cloud/ - record_id: {}'.format(record_id))
+
+    idf_timeframe = request.GET.get('idf_timeframe')
+    
     if record_id:
         # Cloud for a single document
         t_vector = single_document_word_cloud(settings.ES_INDEX,
@@ -159,7 +170,8 @@ def tv_cloud(request):
                                               min_length,
                                               stopwords,
                                               stems)
-        return json_response_message('ok', 'Word cloud generated', t_vector)
+        normalized = normalize_cloud(t_vector['result'], idf_timeframe)
+        return json_response_message('ok', 'Word cloud generated', {'result': normalized})
     else:
         # Cloud for a query
         logger.info('services/cloud/ - multiple document word cloud')
@@ -172,7 +184,7 @@ def tv_cloud(request):
         if request.GET.get('is_timeline'):
             date_range = daterange2dates(request.GET.get('date_range'))
 
-        task = generate_tv_cloud.delay(params, min_length, stopwords, date_range, stems)
+        task = generate_tv_cloud.delay(params, min_length, stopwords, date_range, stems, idf_timeframe)
         logger.info('services/cloud/ - Celery task id: {}'.format(task.id))
 
         return json_response_message('ok', '', {'task': task.id})
